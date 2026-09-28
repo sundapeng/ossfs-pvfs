@@ -321,6 +321,8 @@ class IObjStore {
                                int part_number,
                                uint64_t *crc64_out = nullptr) = 0;
 
+  // Complete and abort consume context on success and failure alike.
+  // After either call, the caller must not reuse or abort the context.
   virtual int complete_multipart_upload(void *context, uint64_t *expected_crc64,
                                         std::string *etag = nullptr) = 0;
 
@@ -369,6 +371,17 @@ class IObjStore {
                        int16_t &type, int64_t &pid, uint64_t owner) {
     return -ENOSYS;
   };
+
+  // A backend that refuses some creates outright (reserved names, virtual
+  // directories) answers true, and OssFs asks check_create before it makes
+  // an inode; the default backends never need the extra call.
+  virtual bool wants_create_check() const {
+    return false;
+  }
+  // 0 when `path` may be created (file, directory or symlink), else -errno.
+  virtual int check_create(std::string_view path) {
+    return 0;
+  }
 
   // Check if an operation is permitted for the given caller.
   // file_stat: the target file/dir's stat (uid/gid/mode).

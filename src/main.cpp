@@ -28,6 +28,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <tuple>
 
 #include "admin/cli_handler.h"
@@ -42,6 +43,8 @@
 #include "fuse_adapter_ll.h"
 #include "options.h"
 #include "oss/oss_store.h"
+#include "pvfs/pvfs_obj_store.h"
+#include "pvfs_options.h"
 
 #define DEV_STDOUT "/dev/stdout"
 #define LOG_SYSLOG "syslog"
@@ -53,6 +56,9 @@ static OssFileSystem::BackgroundVCpuEnv g_bg_vcpu_env;
 static std::string g_mountpoint;
 static bool g_log_to_stdout = false;
 static bool g_log_to_syslog = false;
+static bool g_is_pvfs = false;
+static std::string g_pvfs_catalog;
+static std::unique_ptr<PvfsFileSystem::PvfsRuntime> g_pvfs_runtime;
 
 std::tuple<std::string, std::string> get_oss_credentials() {
   // Use env vars if they are not specified in the command line or the config
@@ -235,6 +241,50 @@ int create_background_obj_stores() {
     g_bg_vcpu_env.bg_obj_store_env->add_obj_store_env(executor, obj_store);
   }
 
+  return 0;
+}
+
+// PVFS mode: the catalog runtime plus one PvfsObjStore per vCPU, so the
+// rest of the mount is the OSS path over a different backend.
+static int create_pvfs_obj_stores() {
+  PvfsFileSystem::PvfsRuntimeOptions opts;
+  int err = PvfsFileSystem::pvfs_runtime_options_from_flags(g_pvfs_catalog,
+                                                            &opts);
+  if (err != 0) return err;
+
+  ScopedBlockAllSignal block_signals;
+  auto hw_concurrency = std::thread::hardware_concurrency();
+  if (hw_concurrency > 0 &&
+      gflags::GetCommandLineFlagInfoOrDie("oss_vcpu_count").is_default &&
+      FLAGS_oss_vcpu_count > hw_concurrency) {
+    FLAGS_oss_vcpu_count = hw_concurrency;
+  }
+  std::vector<photon::Executor *> executors;
+  for (uint64_t i = 0; i < FLAGS_oss_vcpu_count; i++) {
+    executors.push_back(new photon::Executor(
+        OSSFS_EVENT_ENGINE, photon::INIT_IO_NONE, {}, EXECUTOR_QUEUE_OPTION));
+  }
+  g_bg_vcpu_env.bg_obj_store_env = new OssFileSystem::BGVCpuObjStoreEnv;
+  g_pvfs_runtime = std::make_unique<PvfsFileSystem::PvfsRuntime>(opts);
+  err = g_pvfs_runtime->init(executors);
+  if (err != 0) {
+    g_pvfs_runtime.reset();
+    for (auto e : executors) delete e;
+    return err;
+  }
+  for (size_t i = 0; i < executors.size(); i++) {
+    auto store = executors[i]->perform([&]() -> OssFileSystem::IObjStore * {
+      return new PvfsFileSystem::PvfsObjStore(g_pvfs_runtime.get(), i,
+                                              executors[i]);
+    });
+    g_bg_vcpu_env.bg_obj_store_env->add_obj_store_env(executors[i], store);
+  }
+  LOG_INFO("PVFS mount: pvfs://` -> ` (`)", g_pvfs_catalog, g_mountpoint,
+           opts.readonly ? "read-only, pass --pvfs_allow_write to enable writes"
+                         : "writable");
+  LOG_INFO(
+      "PVFS: ` OSS vCPUs shared by all tables (oss_vcpu_count), up to ` tables cached (pvfs_max_table_cache)",
+      executors.size(), opts.cache.max_table_cache);
   return 0;
 }
 
@@ -649,15 +699,15 @@ static void dump_mount_options() {
   }
 }
 
-static void warn_inapplicable_options(bool is_hdfs) {
+static void warn_inapplicable_options(uint8_t mode) {
   auto is_explicitly_set = [](std::string_view name) {
     return !gflags::GetCommandLineFlagInfoOrDie(std::string(name).c_str())
                 .is_default;
   };
   for (const auto &name :
-       OptionsRegistry::get_inapplicable_options(is_hdfs, is_explicitly_set)) {
-    LOG_WARN("option --` only applies to ` mode, ignored in ` mode", name,
-             is_hdfs ? "OSS" : "HDFS", is_hdfs ? "HDFS" : "OSS");
+       OptionsRegistry::get_inapplicable_options(mode, is_explicitly_set)) {
+    LOG_WARN("option --` does not apply to ` mode and is ignored", name,
+             OptionsRegistry::mode_name(mode));
   }
 }
 
@@ -743,6 +793,72 @@ static int set_one_signal_handler(int sig, void (*handler)(int)) {
   return 0;
 }
 
+// The FUSE session lifecycle shared by every backend: session, signal
+// handlers, mount, readiness pipe, loop, teardown. -1 if it never came up.
+static int run_fuse_session(struct fuse_args &args,
+                            struct fuse_cmdline_opts &fuse_opts, int pipefd,
+                            IFileSystemFuseLL *fs, char *completed,
+                            const std::function<void()> &on_mounted) {
+  int err = -1;
+  struct fuse_session *session = nullptr;
+  struct fuse_lowlevel_ops *fs_ops_ll = get_fuse_ll_oper();
+  auto t0 = std::chrono::steady_clock::now();
+
+  if ((session = fuse_session_new(&args, fs_ops_ll,
+                                  sizeof(struct fuse_lowlevel_ops), fs)) ==
+      nullptr) {
+    LOG_ERROR("fuse_session_new failed with error: `", strerror(errno));
+    return err;
+  }
+
+  if (fuse_set_signal_handlers(session) != 0) {
+    LOG_ERROR("set_signal_handlers failed with error: `", strerror(errno));
+    goto sighandler_error;
+  }
+
+  if (FLAGS_enable_test_signal_handler) {
+    if (set_one_signal_handler(SIGUSR1, test_handler) != 0) {
+      LOG_ERROR("set_test_signal_handlers failed with error: `",
+                strerror(errno));
+      goto sighandler_error;
+    }
+  }
+
+  if ((fuse_session_mount(session, fuse_opts.mountpoint)) != 0) {
+    LOG_ERROR("fuse_session_mount failed with error: `", strerror(errno));
+    goto mnt_error;
+  }
+  {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+    LOG_INFO("[MountTiming] fuse session setup and mount completed in ` us",
+             elapsed);
+  }
+  if (on_mounted) on_mounted();
+
+  *completed = 0;
+
+  if (!FLAGS_f) {
+    write(pipefd, completed, sizeof(*completed));
+  }
+
+  fs->set_fuse_session(session);
+
+  err = fuse_session_loop_mt_with_photon(session, FLAGS_fuse_threads);
+
+  if (FLAGS_fuse_device_fd < 0) {
+    fuse_session_unmount(session);
+  }
+
+mnt_error:
+  fuse_remove_signal_handlers(session);
+
+sighandler_error:
+  fuse_session_destroy(session);
+  return err;
+}
+
 static int create_ossfs_and_run_fuse(struct fuse_args &args,
                                      struct fuse_cmdline_opts &fuse_opts,
                                      int pipefd) {
@@ -753,8 +869,6 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
 
   int err = -1;
   char completed = 1;
-  struct fuse_session *session = nullptr;
-  struct fuse_lowlevel_ops *fs_ops_ll;
   OssFileSystem::OssFsOptions fs_options;
   std::unique_ptr<IFileSystemFuseLL> fs;
   auto http_server_thread_deleter = [](std::thread *t) {
@@ -773,7 +887,7 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
     LOG_WARN("Failed to get SSL certificate file");
   }
 
-  err = create_background_obj_stores();
+  err = g_is_pvfs ? create_pvfs_obj_stores() : create_background_obj_stores();
   if (err != 0) {
     LOG_ERROR(
         "create_background_obj_stores failed, please check your oss config");
@@ -785,11 +899,21 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
 #endif
 
   warn_inapplicable_options(
-      OssFileSystem::is_hdfs_endpoint(FLAGS_oss_endpoint));
+      g_is_pvfs ? OptionsRegistry::kModePvfs
+      : OssFileSystem::is_hdfs_endpoint(FLAGS_oss_endpoint)
+          ? OptionsRegistry::kModeHdfs
+          : OptionsRegistry::kModeOss);
   dump_mount_options();
   err = init_fs_options(&fs_options);
   if (err != 0) {
     goto exit;
+  }
+  if (g_is_pvfs) {
+    // Table data has neither appendable objects nor symlinks; writes are
+    // opt-in and --ro still wins.
+    fs_options.enable_appendable_object = false;
+    fs_options.enable_symlink = false;
+    fs_options.readonly = FLAGS_ro || !FLAGS_pvfs_allow_write;
   }
 
   if (!FLAGS_disk_data_cache_dir.empty()) {
@@ -828,7 +952,6 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
 
   parse_fuse_options();
   set_fuse_ll_fs(fs.get());
-  fs_ops_ll = get_fuse_ll_oper();
 
   // OSS mode does not support xattr or locks; the hooks stay null so the
   // kernel receives ENOSYS and stops sending these requests.
@@ -837,66 +960,13 @@ static int create_ossfs_and_run_fuse(struct fuse_args &args,
     LOG_INFO("HDFS mode: xattr/lock fuse hooks enabled");
   }
 
-  {
-    auto t0 = std::chrono::steady_clock::now();
-    if ((session = fuse_session_new(
-             &args, fs_ops_ll, sizeof(struct fuse_lowlevel_ops), fs.get())) ==
-        nullptr) {
-      LOG_ERROR("fuse_session_new failed with error: `", strerror(errno));
-      goto exit;
-    }
-
-    if (fuse_set_signal_handlers(session) != 0) {
-      LOG_ERROR("set_signal_handlers failed with error: `", strerror(errno));
-      goto sighandler_error;
-    }
-
-    if (FLAGS_enable_test_signal_handler) {
-      if (set_one_signal_handler(SIGUSR1, test_handler) != 0) {
-        LOG_ERROR("set_test_signal_handlers failed with error: `",
-                  strerror(errno));
-        goto sighandler_error;
-      }
-    }
-
-    if ((fuse_session_mount(session, fuse_opts.mountpoint)) != 0) {
-      LOG_ERROR("fuse_session_mount failed with error: `", strerror(errno));
-      goto mnt_error;
-    }
-    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                       std::chrono::steady_clock::now() - t0)
-                       .count();
-    LOG_INFO("[MountTiming] fuse session setup and mount completed in ` us",
-             elapsed);
-  }
-
-  {
+  err = run_fuse_session(args, fuse_opts, pipefd, fs.get(), &completed, [&]() {
     auto total_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - mount_start)
                              .count();
     LOG_INFO("[MountTiming] total mount time: ` us (from entry to mount ready)",
              total_elapsed);
-  }
-
-  completed = 0;
-
-  if (!FLAGS_f) {
-    write(pipefd, &completed, sizeof(completed));
-  }
-
-  fs->set_fuse_session(session);
-
-  err = fuse_session_loop_mt_with_photon(session, FLAGS_fuse_threads);
-
-  if (FLAGS_fuse_device_fd < 0) {
-    fuse_session_unmount(session);
-  }
-
-mnt_error:
-  fuse_remove_signal_handlers(session);
-
-sighandler_error:
-  fuse_session_destroy(session);
+  });
 
 exit:
   fs.reset();
@@ -904,6 +974,9 @@ exit:
 
   http_server_thread.reset();
 
+  // The runtime deletes its table stores on the vCPUs the env still owns.
+  if (g_pvfs_runtime) g_pvfs_runtime->shutdown();
+  g_pvfs_runtime.reset();
   if (g_bg_vcpu_env.bg_obj_store_env) delete g_bg_vcpu_env.bg_obj_store_env;
   if (g_bg_vcpu_env.bg_disk_cache_env) delete g_bg_vcpu_env.bg_disk_cache_env;
 
@@ -933,6 +1006,11 @@ static void log_exit_error(char r) {
   }
 
   if (!FLAGS_f) {
+    if (g_is_pvfs) {
+      printf("Mount pvfs://%s to %s successfully\n", g_pvfs_catalog.c_str(),
+             g_mountpoint.c_str());
+      return;
+    }
     auto oss_path = join_paths(FLAGS_oss_bucket, FLAGS_oss_bucket_prefix);
     printf("Mount oss://%s to %s successfully\n", oss_path.c_str(),
            g_mountpoint.c_str());
@@ -980,6 +1058,10 @@ static void do_show_mount_help() {
       mode_part = " [OSS only]";
     } else if (option.modes == OptionsRegistry::kModeHdfs) {
       mode_part = " [HDFS only]";
+    } else if (option.modes == OptionsRegistry::kModePvfs) {
+      mode_part = " [PVFS only]";
+    } else if (option.modes == OptionsRegistry::kModeOssHdfs) {
+      mode_part = " [OSS/HDFS only]";
     }
 
     std::string info_part =
@@ -1037,6 +1119,9 @@ static void do_show_mount_help() {
   for (size_t i = 1; i < all_options.size(); i++) {
     if (!has_visible_options(all_options[i])) continue;
     printf("\n%s:\n", OptionsRegistry::kCategoryNames[i].data());
+    if (i == OptionsRegistry::kPvfsOptions) {
+      printf("  PVFS mounts are read-only unless --pvfs_allow_write is given.\n");
+    }
     for (const auto &option : all_options[i]) {
       print_one(option);
     }
@@ -1152,6 +1237,13 @@ int main(int argc, char *argv[]) {
 
     gflags::ParseCommandLineFlags(&fuse_argc, &fuse_args, true);
     trim_mount_options();
+    // The mode is decided once, here; OSS/HDFS mounts then need a bucket
+    // and an endpoint, PVFS mounts need neither.
+    g_is_pvfs = PvfsFileSystem::pvfs_mode_selected(&g_pvfs_catalog);
+    if (!g_is_pvfs && !OptionsRegistry::require_oss_target()) {
+      fprintf(stderr, "ERROR: --oss_endpoint and --oss_bucket must be set\n");
+      return -1;
+    }
     // Normalize prefix: strip one leading and one trailing slash.
     {
       std::string_view pfx = FLAGS_oss_bucket_prefix;
@@ -1259,7 +1351,9 @@ int main(int argc, char *argv[]) {
       FLAGS_f = true;
     }
 
-    if (FLAGS_ro) {
+    // PVFS mounts are read-only unless writes are opted in; the kernel
+    // then refuses writes before they reach the file system.
+    if (FLAGS_ro || (g_is_pvfs && !FLAGS_pvfs_allow_write)) {
       fuse_opt_add_arg(&args, "-oro");
     }
 
@@ -1281,8 +1375,10 @@ int main(int argc, char *argv[]) {
     // fuse_opt_add_arg internally copies the string, so local std::string is
     // safe.
     std::string fsname_opt =
-        "-ofsname=" + build_fsname(FLAGS_oss_bucket, FLAGS_oss_endpoint,
-                                   FLAGS_oss_bucket_prefix);
+        "-ofsname=" +
+        (g_is_pvfs ? "pvfs://" + g_pvfs_catalog
+                   : build_fsname(FLAGS_oss_bucket, FLAGS_oss_endpoint,
+                                  FLAGS_oss_bucket_prefix));
     fuse_opt_add_arg(&args, fsname_opt.c_str());
 
     int pipefd[2];

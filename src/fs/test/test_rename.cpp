@@ -251,6 +251,7 @@ class Ossfs2RenameTest : public Ossfs2TestSuite {
   }
 
   void verify_rename_keep_old_meta() {
+    if (is_pvfs_test_mode()) GTEST_SKIP() << "no object metadata writes on PVFS";
     uint64_t parent = get_test_dir_parent();
     DEFER(fs_->forget(parent, 1));
     struct stat st;
@@ -1934,6 +1935,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_dir_continuously) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_file_with_oss_err) {
+  if (is_pvfs_test_mode()) GTEST_SKIP() << "store credentials are per table on PVFS";
   SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
@@ -1942,6 +1944,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_file_with_oss_err) {
 }
 
 TEST_F(Ossfs2RenameTest, verify_rename_dir_with_oss_err) {
+  if (is_pvfs_test_mode()) GTEST_SKIP() << "store credentials are per table on PVFS";
   SET_TEST_MODE(kTestOss);
   INIT_PHOTON();
   OssFsOptions opts;
@@ -2018,6 +2021,7 @@ TEST_F(Ossfs2RenameTest, verify_rename_src_not_exist) {
 
 TEST_F(Ossfs2RenameTest, verify_rename_dirty_dir_for_appendable_obj) {
   SET_TEST_MODE(kTestOss);
+  if (is_pvfs_test_mode()) GTEST_SKIP() << "no appendable objects on PVFS";
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_appendable_object = true;

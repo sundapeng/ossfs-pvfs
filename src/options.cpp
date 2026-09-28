@@ -25,12 +25,15 @@ const std::set<std::string> OptionsRegistry::kSensitiveOptions = {
     "oss_access_key_id",
     "oss_access_key_secret",
     "http_proxy",
+    "pvfs_access_key_id",
+    "pvfs_access_key_secret",
+    "pvfs_security_token",
 };
 
 const std::string_view OptionsRegistry::kCategoryNames[] = {
     "GeneralOptions",        "FileSystemOptions", "OssBucketOptions",
     "OssCredentialsOptions", "CachingOptions",    "OssClientOptions",
-    "LoggingOptions",        "AdvancedOptions",
+    "LoggingOptions",        "AdvancedOptions",   "PvfsOptions",
 };
 
 static_assert(sizeof(OptionsRegistry::kCategoryNames) /
@@ -38,10 +41,22 @@ static_assert(sizeof(OptionsRegistry::kCategoryNames) /
                   OptionsRegistry::OptionCategory::kCount,
               "kCategoryNames size mismatch");
 
+const char *OptionsRegistry::mode_name(uint8_t mode) {
+  switch (mode) {
+    case kModeOss:
+      return "OSS";
+    case kModeHdfs:
+      return "HDFS";
+    case kModePvfs:
+      return "PVFS";
+    default:
+      return "unknown";
+  }
+}
+
 std::vector<std::string> OptionsRegistry::get_inapplicable_options(
-    bool is_hdfs,
+    uint8_t current_mode,
     const std::function<bool(std::string_view)> &is_explicitly_set) {
-  uint8_t current_mode = is_hdfs ? kModeHdfs : kModeOss;
   std::vector<std::string> result;
   for (const auto &category : options_) {
     for (const auto &option : category) {
@@ -173,11 +188,17 @@ static bool validate_nonempty_string(const char *flagname,
                                      const std::string &value) {
   return !value.empty();
 }
-DEFINE_validator(oss_endpoint, &validate_nonempty_string);
 
 DEFINE_OPTION(oss_bucket, string, "", "OSS bucket name", kOssBucketOptions,
               false, false, kModeAll);
-DEFINE_validator(oss_bucket, &validate_nonempty_string);
+
+// PVFS mounts a catalog, not a bucket, so these two requirements are
+// installed by main once it knows the mode instead of at static init.
+bool OptionsRegistry::require_oss_target() {
+  gflags::RegisterFlagValidator(&FLAGS_oss_endpoint, &validate_nonempty_string);
+  gflags::RegisterFlagValidator(&FLAGS_oss_bucket, &validate_nonempty_string);
+  return !FLAGS_oss_endpoint.empty() && !FLAGS_oss_bucket.empty();
+}
 
 DEFINE_OPTION(oss_bucket_prefix, string, "", "OSS bucket prefix path",
               kOssBucketOptions, false, false, kModeAll);
@@ -198,11 +219,11 @@ DEFINE_OPTION(oss_access_key_secret, string, "", "OSS access key secret",
               kOssCredentialsOptions, false, false, kModeAll);
 
 DEFINE_OPTION(ram_role, string, "", "RAM role name", kOssCredentialsOptions,
-              false, false, kModeOss);
+              false, false, kModeOssHdfs);
 
 DEFINE_OPTION(credential_process, string, "",
               "External credential process command", kOssCredentialsOptions,
-              false, false, kModeOss);
+              false, false, kModeOssHdfs);
 
 static bool validate_credential_process(const char *flagname,
                                         const std::string &value) {
@@ -374,7 +395,7 @@ DEFINE_validator(disk_data_cache_max_file_size, &validate_bytes_string);
 
 // ==================== Oss Client Options ====================
 DEFINE_OPTION(upload_buffer_size, string, "8MiB", "Upload buffer size",
-              kOssClientOptions, false, false, kModeOss);
+              kOssClientOptions, false, false, kModeOssPvfs);
 static bool validate_upload_buffer_size(const char *flagname,
                                         const std::string &value) {
   auto size = parse_bytes_string(value);
@@ -527,7 +548,7 @@ DEFINE_OPTION(enable_crc64, bool, true,
               kOssClientOptions, false, false, kModeOss);
 
 DEFINE_OPTION(oss_vcpu_count, uint64, 8, "The number of OSS background vCPUs",
-              kOssClientOptions, false, true, kModeOss);
+              kOssClientOptions, false, true, kModeOssPvfs);
 static bool validate_oss_vcpu_count(const char *flagname, uint64_t value) {
   return value >= 1 && value <= 128;
 }
@@ -581,7 +602,7 @@ DEFINE_OPTION(bind_ips, string, "",
 DEFINE_OPTION(enable_ipv6, bool, true,
               "Allow IPv6 addresses when resolving the endpoint and proxy "
               "host. Set false to connect over IPv4 only",
-              kOssClientOptions, false, false, kModeOss);
+              kOssClientOptions, false, false, kModeOssPvfs);
 DEFINE_OPTION(path_style, bool, false,
               "Use path-style requests http(s)://endpoint/bucket/object "
               "instead of the virtual-hosted style "
@@ -656,3 +677,63 @@ DEFINE_OPTION(fuse_device_fd, int32, -1,
               "Pre-opened FUSE device file descriptor for unprivileged "
               "launch. -1 means ossfs2 opens /dev/fuse itself",
               kAdvancedOptions, false, false, kModeAll);
+
+// ==================== PVFS options ====================
+DEFINE_OPTION(pvfs_catalog, string, "",
+              "Paimon catalog name (or pass pvfs://catalog as oss_bucket)",
+              kPvfsOptions, false, false, kModePvfs);
+DEFINE_OPTION(pvfs_endpoint, string, "",
+              "DLF Paimon REST API endpoint (e.g. dlfnext.cn-shanghai.aliyuncs.com)",
+              kPvfsOptions, false, false, kModePvfs);
+DEFINE_OPTION(pvfs_region, string, "",
+              "Region for DLF Paimon REST API (e.g. cn-shanghai)", kPvfsOptions,
+              false, false, kModePvfs);
+DEFINE_OPTION(pvfs_access_key_id, string, "",
+              "Access key ID for DLF Paimon REST API (control plane)",
+              kPvfsOptions, false, false, kModePvfs);
+DEFINE_OPTION(pvfs_access_key_secret, string, "",
+              "Access key secret for DLF Paimon REST API (control plane)",
+              kPvfsOptions, false, false, kModePvfs);
+DEFINE_OPTION(pvfs_security_token, string, "",
+              "STS security token for DLF Paimon REST API (optional)",
+              kPvfsOptions, false, false, kModePvfs);
+DEFINE_OPTION(pvfs_oss_endpoint, string, "",
+              "OSS endpoint override for PVFS data plane (optional)",
+              kPvfsOptions, false, false, kModePvfs);
+DEFINE_OPTION(pvfs_allow_metadata_write, bool, false,
+              "With pvfs_allow_write, also allow writes under a table's Paimon "
+              "metadata directories (snapshot, manifest, schema, index, "
+              "changelog, statistics, tag, branch, consumer, bucket-*)",
+              kPvfsOptions, false, false, kModePvfs);
+DEFINE_OPTION(pvfs_external_oss_endpoint, string, "",
+              "OSS endpoint for external table locations, used with "
+              "oss_access_key_id/oss_access_key_secret (defaults to "
+              "pvfs_oss_endpoint) [PVFS only]",
+              kPvfsOptions, false, false, kModePvfs);
+DEFINE_OPTION(pvfs_location_cache_ttl, int32, 300,
+              "Table location cache TTL in seconds", kPvfsOptions, false, false,
+              kModePvfs);
+DEFINE_OPTION(pvfs_credential_refresh_ahead, int32, 60,
+              "Seconds before expiry to refresh table credentials",
+              kPvfsOptions, false, false, kModePvfs);
+static bool validate_pvfs_refresh_ahead(const char *flagname, int32_t value) {
+  return value >= 0 && value < 1800;
+}
+DEFINE_validator(pvfs_credential_refresh_ahead, &validate_pvfs_refresh_ahead);
+DEFINE_OPTION(pvfs_max_table_cache, int32, 50,
+              "Number of tables whose OSS clients and credentials stay cached",
+              kPvfsOptions, false, false, kModePvfs);
+DEFINE_OPTION(pvfs_signing_algorithm, string, "auto",
+              "Signing algorithm for PVFS REST API: auto (detect from endpoint), "
+              "default (DLF4-HMAC-SHA256 for VPC), openapi (ROA HMAC-SHA1 for "
+              "dlfnext)",
+              kPvfsOptions, false, false, kModePvfs);
+static bool validate_pvfs_signing_algorithm(const char *flagname,
+                                            const std::string &value) {
+  return value == "auto" || value == "default" || value == "openapi";
+}
+DEFINE_validator(pvfs_signing_algorithm, &validate_pvfs_signing_algorithm);
+DEFINE_OPTION(pvfs_allow_write, bool, false,
+              "Allow writes through the PVFS mount; without it the mount is "
+              "read-only, as with ro, and --ro still wins",
+              kPvfsOptions, false, false, kModePvfs);

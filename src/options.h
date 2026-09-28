@@ -39,13 +39,17 @@ class OptionsRegistry {
     kOssClientOptions,
     kLoggingOptions,
     kAdvancedOptions,
+    kPvfsOptions,
     kCount,
   };
 
   enum OptionMode : uint8_t {
     kModeOss = 1 << 0,
     kModeHdfs = 1 << 1,
-    kModeAll = kModeOss | kModeHdfs,
+    kModePvfs = 1 << 2,
+    kModeOssHdfs = kModeOss | kModeHdfs,
+    kModeOssPvfs = kModeOss | kModePvfs,
+    kModeAll = kModeOss | kModeHdfs | kModePvfs,
   };
 
   static const std::string_view kCategoryNames[];
@@ -68,8 +72,12 @@ class OptionsRegistry {
   // Return names of options that do not apply to the current backend mode,
   // filtered by is_explicitly_set (e.g. non-default gflags values at mount).
   static std::vector<std::string> get_inapplicable_options(
-      bool is_hdfs,
+      uint8_t current_mode,
       const std::function<bool(std::string_view)> &is_explicitly_set);
+  static const char *mode_name(uint8_t mode);
+  // Register the non-empty validators for --oss_endpoint/--oss_bucket and
+  // check the current values; OSS/HDFS mode only.
+  static bool require_oss_target();
 
   const static std::set<std::string> kSensitiveOptions;
 
@@ -212,3 +220,19 @@ DECLARE_string(metrics_ip);
 DECLARE_bool(enable_test_signal_handler);
 DECLARE_bool(enable_admin_server);
 DECLARE_int32(fuse_device_fd);
+
+// ==================== PVFS options ====================
+DECLARE_string(pvfs_catalog);
+DECLARE_string(pvfs_endpoint);
+DECLARE_string(pvfs_region);
+DECLARE_string(pvfs_access_key_id);
+DECLARE_string(pvfs_access_key_secret);
+DECLARE_string(pvfs_security_token);
+DECLARE_string(pvfs_oss_endpoint);
+DECLARE_string(pvfs_external_oss_endpoint);
+DECLARE_bool(pvfs_allow_write);
+DECLARE_bool(pvfs_allow_metadata_write);
+DECLARE_int32(pvfs_location_cache_ttl);
+DECLARE_int32(pvfs_credential_refresh_ahead);
+DECLARE_string(pvfs_signing_algorithm);
+DECLARE_int32(pvfs_max_table_cache);

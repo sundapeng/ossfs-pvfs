@@ -37,6 +37,7 @@ class Ossfs2BasicTest : public Ossfs2TestSuite {
     r = fs_->rmdir(root_nodeid_, get_test_osspath("test_dir").c_str());
     ASSERT_EQ(r, 0);
 
+    if (is_pvfs_test_mode()) return;  // no ossutil against a catalog
     auto ossutil = lookup_ossutil();
     ASSERT_NE(ossutil, "");
   }

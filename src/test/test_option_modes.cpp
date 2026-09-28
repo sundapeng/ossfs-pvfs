@@ -53,13 +53,13 @@ TEST(OptionModes, RegisteredMetadata) {
   EXPECT_EQ(find_mode("oss_hdfs_client_options"), kModeHdfs);
 
   EXPECT_EQ(find_mode("enable_crc64"), kModeOss);
-  EXPECT_EQ(find_mode("enable_ipv6"), kModeOss);
+  EXPECT_EQ(find_mode("enable_ipv6"), OptionsRegistry::kModeOssPvfs);
   EXPECT_EQ(find_mode("temp_dir"), kModeOss);
   EXPECT_EQ(find_mode("disk_data_cache_dir"), kModeOss);
   EXPECT_EQ(find_mode("http_proxy"), kModeOss);
-  EXPECT_EQ(find_mode("ram_role"), kModeOss);
-  EXPECT_EQ(find_mode("credential_process"), kModeOss);
-  EXPECT_EQ(find_mode("upload_buffer_size"), kModeOss);
+  EXPECT_EQ(find_mode("ram_role"), OptionsRegistry::kModeOssHdfs);
+  EXPECT_EQ(find_mode("credential_process"), OptionsRegistry::kModeOssHdfs);
+  EXPECT_EQ(find_mode("upload_buffer_size"), OptionsRegistry::kModeOssPvfs);
 
   EXPECT_EQ(find_mode("attr_timeout"), kModeAll);
   EXPECT_EQ(find_mode("oss_endpoint"), kModeAll);
@@ -70,9 +70,9 @@ TEST(OptionModes, RegisteredMetadata) {
 TEST(OptionModes, NoResultWhenNothingExplicitlySet) {
   auto never_set = [](std::string_view) { return false; };
   EXPECT_TRUE(
-      OptionsRegistry::get_inapplicable_options(false, never_set).empty());
+      OptionsRegistry::get_inapplicable_options(kModeOss, never_set).empty());
   EXPECT_TRUE(
-      OptionsRegistry::get_inapplicable_options(true, never_set).empty());
+      OptionsRegistry::get_inapplicable_options(kModeHdfs, never_set).empty());
 }
 
 TEST(OptionModes, InapplicableOptionsByPredicate) {
@@ -82,12 +82,12 @@ TEST(OptionModes, InapplicableOptionsByPredicate) {
     return explicitly_set.count(name) > 0;
   };
 
-  auto oss_side = OptionsRegistry::get_inapplicable_options(false, is_set);
+  auto oss_side = OptionsRegistry::get_inapplicable_options(kModeOss, is_set);
   EXPECT_TRUE(contains(oss_side, "default_permissions"));
   EXPECT_FALSE(contains(oss_side, "enable_crc64"));
   EXPECT_FALSE(contains(oss_side, "attr_timeout"));
 
-  auto hdfs_side = OptionsRegistry::get_inapplicable_options(true, is_set);
+  auto hdfs_side = OptionsRegistry::get_inapplicable_options(kModeHdfs, is_set);
   EXPECT_TRUE(contains(hdfs_side, "enable_crc64"));
   EXPECT_FALSE(contains(hdfs_side, "default_permissions"));
   EXPECT_FALSE(contains(hdfs_side, "attr_timeout"));
@@ -96,12 +96,12 @@ TEST(OptionModes, InapplicableOptionsByPredicate) {
 TEST(OptionModes, AllExplicitlySetMatchesModeMetadata) {
   auto always_set = [](std::string_view) { return true; };
 
-  auto oss_side = OptionsRegistry::get_inapplicable_options(false, always_set);
+  auto oss_side = OptionsRegistry::get_inapplicable_options(kModeOss, always_set);
   EXPECT_TRUE(contains(oss_side, "default_permissions"));
   EXPECT_FALSE(contains(oss_side, "enable_crc64"));
   EXPECT_FALSE(contains(oss_side, "attr_timeout"));
 
-  auto hdfs_side = OptionsRegistry::get_inapplicable_options(true, always_set);
+  auto hdfs_side = OptionsRegistry::get_inapplicable_options(kModeHdfs, always_set);
   EXPECT_TRUE(contains(hdfs_side, "enable_crc64"));
   EXPECT_FALSE(contains(hdfs_side, "default_permissions"));
   EXPECT_FALSE(contains(hdfs_side, "attr_timeout"));
