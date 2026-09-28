@@ -654,6 +654,7 @@ class OssFs : public IFileSystemFuseLL {
   size_t max_prefetch_window_size_per_handle_ = 0;
 
   std::atomic<bool> is_stopping_ = {false};
+  bool create_check_ = false;  // the store wants check_create before creates
 
   // for uploading to oss
   std::unique_ptr<photon::semaphore> upload_sem_;

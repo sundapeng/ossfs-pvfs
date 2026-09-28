@@ -370,6 +370,17 @@ class IObjStore {
     return -ENOSYS;
   };
 
+  // A backend that refuses some creates outright (reserved names, virtual
+  // directories) answers true, and OssFs asks check_create before it makes
+  // an inode; the default backends never need the extra call.
+  virtual bool wants_create_check() const {
+    return false;
+  }
+  // 0 when `path` may be created (file, directory or symlink), else -errno.
+  virtual int check_create(std::string_view path) {
+    return 0;
+  }
+
   // Check if an operation is permitted for the given caller.
   // file_stat: the target file/dir's stat (uid/gid/mode).
   //            For dir ops (mkdir/create/etc), this is the *parent* dir's stat.

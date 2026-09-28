@@ -651,6 +651,7 @@ class Ossfs2ReadWriteTest : public Ossfs2TestSuite {
   }
 
   void verify_readwrite_archive_and_ia_object() {
+    if (is_pvfs_test_mode()) GTEST_SKIP() << "no object metadata writes on PVFS";
     // 1. test Archive object
     struct stat st;
     uint64_t parent = get_test_dir_parent();
@@ -3082,6 +3083,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_init_multipart_error) {
 
 TEST_F(Ossfs2ReadWriteTest, verify_read_dirty_object_with_oss_error) {
   SET_TEST_MODE(kTestOss);
+  if (is_pvfs_test_mode()) GTEST_SKIP() << "no appendable objects on PVFS";
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_appendable_object = true;
@@ -3160,6 +3162,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_create_and_write_with_different_handle) {
 TEST_F(Ossfs2ReadWriteTest,
        verify_create_and_write_with_different_handle_for_appendable_object) {
   SET_TEST_MODE(kTestOss);
+  if (is_pvfs_test_mode()) GTEST_SKIP() << "no appendable objects on PVFS";
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_appendable_object = true;
@@ -3244,6 +3247,7 @@ TEST_F(Ossfs2ReadWriteTest, verify_close_to_open_with_share_fd_read_buffer) {
 }
 
 TEST_F(Ossfs2ReadWriteTest, verify_open_with_append_flag) {
+  if (is_pvfs_test_mode()) GTEST_SKIP() << "no appendable objects on PVFS";
   INIT_PHOTON();
   OssFsOptions opts;
   SET_TEST_MODE(kTestOss | kTestHdfs);

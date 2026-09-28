@@ -2093,6 +2093,12 @@ int OssFs::create_internal(uint64_t parent, std::string_view name, int flags,
   if (full_path.back() != '/') full_path.append("/");
   full_path.append(name.data(), name.size());
 
+  // A refusal the store knows in advance comes before any probe or inode.
+  if (create_check_) {
+    r = PERFORM_BACKGROUND_OBJ_REQUEST(this, check_create, full_path);
+    if (r < 0) return r;
+  }
+
   // Not found in negative cache, look it up on the cloud.
   if (!negative_cache_ || !negative_cache_->exists(full_path)) {
     if (negative_cache_) {
@@ -2932,6 +2938,7 @@ int OssFs::init() {
   if (creds_provider_) {
     register_creds_refresh_handler();
   }
+  create_check_ = PERFORM_BACKGROUND_OBJ_REQUEST(this, wants_create_check);
 
   if (is_hdfs_mode()) {
     init_hdfs_root_inode();

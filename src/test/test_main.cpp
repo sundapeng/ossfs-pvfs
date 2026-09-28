@@ -69,6 +69,17 @@ int main(int argc, char **arg) {
     LOG_WARN("Failed to get SSL certificate file");
   }
 
+  // Invoked as pvfs-test: run the PVFS suites (minus the benchmark) unless
+  // a filter is given.
+  std::string self(arg[0]);
+  bool has_filter = false;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(arg[i]).rfind("--gtest_filter", 0) == 0) has_filter = true;
+  }
+  if (!has_filter && self.size() >= 9 &&
+      self.compare(self.size() - 9, 9, "pvfs-test") == 0) {
+    ::testing::GTEST_FLAG(filter) = "Pvfs*:-PvfsBenchTest.*";
+  }
   ::testing::InitGoogleTest(&argc, arg);
 
   std::string config_file = extract_config_file(argc, arg);

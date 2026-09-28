@@ -113,6 +113,16 @@ struct BGVCpuObjStoreEnv : public VCpuObjStoreEnv {
   }
 };
 
+// Perform an object store call on the next vCPU of a given env (the
+// PERFORM_BACKGROUND_OBJ_REQUEST variant for code that is not an OssFs).
+#define PERFORM_BG_ENV_OBJ_REQUEST(__env, __func, ...)                   \
+  ({                                                                     \
+    auto __ctx = (__env)->get_obj_store_env_next();                      \
+    auto __r = __ctx.executor->perform(                                  \
+        [&]() { return __ctx.obj_store->__func(__VA_ARGS__); });         \
+    __r;                                                                 \
+  })
+
 //
 // A background vCPU environment for disk cache operations. Local store
 // requests are dispatched round-robin to the registered executors (libaio

@@ -27,6 +27,7 @@
 
 #include <chrono>
 #include <fstream>
+#include <optional>
 #include <queue>
 #include <random>
 #include <thread>
@@ -39,6 +40,7 @@
 #include "fs/file.h"
 #include "fs/file_hdfs.h"
 #include "fs/fs.h"
+#include "pvfs/test/pvfs_test_helper.h"
 #include "test_util.h"
 
 using namespace OssFileSystem;
@@ -72,6 +74,8 @@ int random_disk_cache_io_engine(int specified_engine);
 
 // Check if the endpoint indicates HDFS mode.
 bool is_hdfs_test_mode();
+// PVFS mode (--pvfs_catalog): the suite's OssFs runs on PvfsObjStore with
+// oss_bucket_prefix as the table path; it counts as kTestOss.
 
 // Bitflags declaring which backend mode(s) a test supports.
 enum TestMode : uint32_t {
@@ -280,6 +284,13 @@ class Ossfs2TestSuite : public ::testing::Test {
   bool is_hdfs_mode_ = false;
   std::string hdfs_client_options_;  // custom SDK options for HDFS tests
   std::unique_ptr<HdfsTestHelper> hdfs_helper_;
+  // PVFS mode: ossutil stand-in and the runtime behind the vCPU env.
+  std::unique_ptr<PvfsTestHelper> pvfs_helper_;
+  std::unique_ptr<PvfsTestEnv> pvfs_env_;
+  // Set before init(): the sub-tree the OssFs is rooted at (default the
+  // oss_bucket_prefix; "" for the whole catalog) and a read-only runtime.
+  std::optional<std::string> pvfs_prefix_;
+  bool pvfs_readonly_ = false;
 
   // help functions
  protected:

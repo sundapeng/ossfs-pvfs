@@ -590,6 +590,7 @@ TEST_F(Ossfs2OpenCloseTest, verify_open_truncate) {
 }
 
 TEST_F(Ossfs2OpenCloseTest, verify_open_truncate_for_appendable_object) {
+  if (is_pvfs_test_mode()) GTEST_SKIP() << "no appendable objects on PVFS";
   INIT_PHOTON();
   OssFsOptions opts;
   opts.enable_appendable_object = true;
