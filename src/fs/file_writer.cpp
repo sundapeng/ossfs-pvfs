@@ -1902,6 +1902,7 @@ int OssRandomWriter::flush_multipart(uint64_t file_size) {
         has_crc && !crc_incomplete_.load(std::memory_order_acquire) ? &whole_crc
                                                                     : nullptr,
         &new_etag);
+    upload_ctx = nullptr;  // complete consumes the context even on failure
   }
   if (r < 0) {
     LOG_ERROR("complete failed, nodeid `, r `", inode_->nodeid, r);
@@ -1913,10 +1914,12 @@ int OssRandomWriter::flush_multipart(uint64_t file_size) {
   return 0;
 
 cleanup:
-  int abort_r =
-      PERFORM_BACKGROUND_OBJ_REQUEST(fs_, abort_multipart_upload, upload_ctx);
-  if (abort_r < 0) {
-    LOG_ERROR("abort failed, nodeid `, abort_r `", inode_->nodeid, abort_r);
+  if (upload_ctx) {
+    int abort_r =
+        PERFORM_BACKGROUND_OBJ_REQUEST(fs_, abort_multipart_upload, upload_ctx);
+    if (abort_r < 0) {
+      LOG_ERROR("abort failed, nodeid `, abort_r `", inode_->nodeid, abort_r);
+    }
   }
   return r;
 }

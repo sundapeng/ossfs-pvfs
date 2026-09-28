@@ -1,149 +1,99 @@
-# OSSFS2
+# paimonfuse
 
-[OSSFS2 中文文档](https://help.aliyun.com/zh/oss/developer-reference/ossfs-2-0)
+A FUSE filesystem for Apache Paimon RestCatalog
 
-## Overview
+English | [简体中文](README_zh.md)
 
-OSSFS2 is a high-performance file client for mounting an [Alibaba Cloud OSS (Object Storage Service)](https://www.alibabacloud.com/en/product/object-storage-service) bucket as a local filesystem. It has excellent sequential read and write throughput that fully leverage the high bandwidth advantages of OSS.
+paimonfuse is a patch set on top of [ossfs2](https://github.com/aliyun/ossfs) (upstream `main` @ `9cd0c7e`, release 2.0.10). It mounts a Paimon RestCatalog (for example, DLF — Data Lake Formation) as a local filesystem:
 
-It is optimized for applications with high storage performance requirements, such as AI training, inference, big data processing, autonomous driving, and other new compute-intensive workloads. These workloads primarily involve sequential and random reads, sequential (append-only) write operations, and do not require full POSIX semantics.
+- `/` and `/<database>/` are virtual directories served by the Paimon REST catalog API (`list_databases`, `list_tables`) and refuse any change;
+- `/<database>/<table>/...` maps to the table's OSS location. Managed tables use a per-table STS token from `get_table_token`; external tables can use separately configured OSS credentials. The control-plane credential only signs REST calls;
+- under a table directory you get the standard ossfs2 engine: PVFS is a third `IObjStore` backend (`PvfsObjStore`, alongside `OssStore` and `OssHdfsStore`). It reuses `OssFs` for the staged inode cache, pipelined readahead, concurrent multipart uploads, random writes, memory/disk cache and metrics, with a backend pre-create check for virtual and protected paths.
 
-OSSFS2 delivers **significant performance gains with very low CPU and memory overhead**, via the following key optimizations:
-* **Redesigned filesystem engine based on the [libfuse3](https://github.com/libfuse/libfuse) Low-Level API**, avoiding the additional performance and memory overhead of the High-Level API.
-* **High-performance, coroutine-based HTTP client built on [PhotonLibOS](https://github.com/alibaba/PhotonLibOS)** for efficient communication with OSS.
-* **Fine-grained resource control through coroutines, memory pools, and elimination of unnecessary memory copies**, significantly lowering client-side CPU and memory consumption.
-* **Efficient cross-platform CRC64 checksumming on writes**, ensuring data integrity with very low overhead.
-* **Pipelined prefetching with sliding windows**, maximizing throughput and minimizing latency for sequential reads.
+> [!IMPORTANT]
+> The mount is **read-only by default** for shell tools, Python jobs and notebooks, and direct reads of Format Table and Object Table data. Writing is opt-in (`--pvfs_allow_write`). Even then, changes are refused when the first path component below the table root is `snapshot`, `manifest`, `schema`, `index`, `changelog`, `statistics`, `tag`, `branch`, `consumer` or `bucket-*`, unless `--pvfs_allow_metadata_write` is also given. This guard does not protect arbitrary data files or nested bucket directories once writes are enabled. Use Paimon's writers for changes that must commit table metadata; paimonfuse exposes the underlying files, not a transactional table view.
 
-> [!NOTE] 
-> The [`main`](https://github.com/aliyun/ossfs/tree/main) branch now defaults to OSSFS2. For OSSFS1, please refer to [`main-v1`](https://github.com/aliyun/ossfs/tree/main-v1) branch, which will continue to receive updates and maintenance.
+## Repository layout
 
-## Performance Improvements
+| Branch | Content |
+|---|---|
+| `paimonfuse` (default) | upstream ossfs2 + the patch, as a single commit |
+| `main` | untouched mirror of `aliyun/ossfs` `main` (`9cd0c7e`), kept for tracking and rebasing |
 
-OSSFS2 delivers significant performance improvements over OSSFS1, particularly in sequential read/write operations and high-concurrency small-file reads. For detailed benchmark results, please refer to the [Performance Benchmarks](https://www.alibabacloud.com/help/en/oss/developer-reference/performance-test-of-ossfs-2-0).
+The upstream README is preserved at [original-README.md](original-README.md).
 
-All tests use a **per-thread-per-file** concurrency model (each thread reads/writes its own independent file).
+## Getting and applying the patch
 
-Compared to OSSFS1, OSSFS2 delivers:
-* **1800% higher throughput** in single-threaded sequential large-file (100 GiB) writes.
-* **Over 300% higher throughput** in sequential large-file (100 GiB) reads with either 1 or 4 threads.
-* **More than 2000% higher throughput** in concurrent small-file (128 KiB) reads under 128-thread workloads.
-
-## Limitations
-
-OSSFS2 does not support full POSIX semantics. See limitations on [OSSFS2 Overview](https://www.alibabacloud.com/help/en/oss/developer-reference/ossfs-2-0).
-
-## Getting Started
-
-### Installing Pre-compiled Packages
-
-We provide packages for common Linux distributions:
-
-* Alibaba Cloud Linux 2 (x86_64)
-* Alibaba Cloud Linux 3 (x86_64 and aarch64)
-* CentOS 7 and 8 (x86_64)
-* Ubuntu 14.04 or later (x86_64)
-* Debian 11 or later (x86_64)
-
-Please select the corresponding package for download and installation from the [Releases Page](https://github.com/aliyun/ossfs/releases).
-
-On Ubuntu, execute the following command to install:
+Download it as a file — [compare main...paimonfuse](https://github.com/sundapeng/ossfs-pvfs/compare/main...paimonfuse) ([.patch](https://github.com/sundapeng/ossfs-pvfs/compare/main...paimonfuse.patch), [.diff](https://github.com/sundapeng/ossfs-pvfs/compare/main...paimonfuse.diff)) — or cherry-pick the commit directly:
 
 ```bash
-sudo dpkg -i <your_ossfs2_package>.deb
+git remote add paimonfuse https://github.com/sundapeng/ossfs-pvfs.git
+git fetch paimonfuse
+git checkout 9cd0c7e && git cherry-pick paimonfuse/paimonfuse
 ```
 
-On Alibaba Cloud Linux/CentOS, execute the following command to install:
+## Mounting
+
+Build the binary using the [instructions below](#building), then create the mount directory and run:
 
 ```bash
-sudo yum install <your_ossfs2_package>.rpm -y
+mkdir -p /mnt/paimon
+./build/ossfs2 mount /mnt/paimon \
+  --pvfs_catalog=<catalog> \
+  --pvfs_endpoint=dlfnext.<region>.aliyuncs.com \
+  --pvfs_region=<region>
 ```
 
-For other Linux distributions not listed above, you can compile and install OSSFS2 from source code. Please refer to the [Building from Source](#building-from-source) section below for detailed instructions.
+`--oss_bucket=pvfs://<catalog>` selects the mode as well. Control-plane credentials come from `PVFS_ACCESS_KEY_ID` / `PVFS_ACCESS_KEY_SECRET`, or the `--pvfs_access_key_id` / `--pvfs_access_key_secret` flags. The mount options keep their `pvfs_` prefix from the feature's development name.
 
-After installation, you can check the ossfs2 version information with the `ossfs2 --version` command.
+External tables can use `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` (or `--oss_access_key_id` / `--oss_access_key_secret`), with `--pvfs_external_oss_endpoint` for their OSS endpoint. Without those credentials they fall back to the catalog token, which may not cover the external location.
 
-### Mounting Your Bucket
+```console
+$ ls /mnt/paimon
+sales  inventory
+$ ls /mnt/paimon/sales/orders
+data  manifest  schema  snapshot
+$ cat /mnt/paimon/sales/orders/schema/schema-0
+...
+$ cp /mnt/paimon/sales/orders/data/bucket-0/data-*.orc .
+```
 
-You'll need valid OSS access credentials to mount your bucket. OSSFS2 supports the following access credential configurations:
+## Key options
 
-* `OSS_ACCESS_KEY_ID` and `OSS_ACCESS_KEY_SECRET` environment variables:
+| Option | Default | Meaning |
+|---|---|---|
+| `--pvfs_catalog` | | catalog to mount (or `--oss_bucket=pvfs://<catalog>`) |
+| `--pvfs_endpoint`, `--pvfs_region` | | REST endpoint and its region (region is derived if omitted) |
+| `--pvfs_allow_write` | `false` | make the mount writable |
+| `--pvfs_allow_metadata_write` | `false` | with writes on, also allow changes under the reserved directories |
+| `--pvfs_location_cache_ttl` | `300` s | table location cache |
+| `--pvfs_credential_refresh_ahead` | `60` s | refresh table tokens this far ahead of expiry |
+| `--pvfs_max_table_cache` | `50` | cached table entries (location + token + store) |
+| `--pvfs_signing_algorithm` | `auto` | `auto` / `default` (DLF4) / `openapi` (ROA) |
+| `--pvfs_external_oss_endpoint` | | endpoint for external tables served with user credentials |
+
+Boundaries: cross-table rename returns `EXDEV`; symlink, appendable objects and xattr are unsupported. `flock` is local to the mount and does not coordinate writers across mounts. Two mounts writing the same object resolve last-writer-wins, as in OSS mode.
+
+## Building
+
+Same as upstream ossfs2 — the dependencies are vendored, no network needed:
 
 ```bash
-export OSS_ACCESS_KEY_ID=<your_access_key_id>
-export OSS_ACCESS_KEY_SECRET=<your_access_key_secret>
-ossfs2 mount /path/to/mount --oss_endpoint=<your_endpoint> --oss_bucket=<your_bucket>
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_TESTING=ON
+cmake --build build -j$(nproc)
 ```
 
-* ECSRAMRole:
+## Status
+
+Experimental preview. Run the credential-free path, signing, option and local HTTP tests after building:
 
 ```bash
-ossfs2 mount /path/to/mount --oss_endpoint=<your_endpoint> --oss_bucket=<your_bucket> --ram_role=<your_ecs_ram_role>
+./build/ossfs2-test --config_file=/dev/null \
+  --gtest_filter='PvfsPathParse.*:DlfSignerGolden.*:PvfsOptions.*:PvfsLogThrottle.*:PvfsRestStubTest.*:PvfsRestResponseTest.*:PvfsObjStoreStubTest.*'
 ```
 
-* `--oss_access_key_id` and `--oss_access_key_secret` mount options:
-
-```bash
-ossfs2 mount /path/to/mount --oss_endpoint=<your_endpoint> --oss_bucket=<your_bucket> \
-  --oss_access_key_id=<your_access_key_id> --oss_access_key_secret=<your_access_key_secret>
-```
-
-> [!NOTE] 
-> It is strongly recommended to use ECSRAMRole or environment variables for mounting.
-
-Now you can access OSS just like a local file system:
-
-```bash
-ls /path/to/mount
-echo "123" > /path/to/mount/test.txt
-cat /path/to/mount/test.txt
-```
-
-Once you have finished working with the mount point, you can unmount it with the following command:
-
-```bash
-umount /path/to/mount
-```
-
-In addition to setting parameters directly in the startup command, OSSFS2 also supports mounting using a [configuration file](https://www.alibabacloud.com/help/en/oss/developer-reference/configure-ossfs-2-0). For more details on mount options, run `ossfs2 mount --help` or visit [Mount Options Description](https://www.alibabacloud.com/help/en/oss/developer-reference/description-of-mount-options).
-
-## Troubleshooting
-
-For debugging purposes, you can enable debug logs by setting the `--log_level=debug` option. The logs will be written to `/tmp/ossfs2` directory by default, and this location can be changed with the `--log_dir` option.
-
-If you are running multiple OSSFS2 processes, we strongly recommend using a dedicated `log_dir` for each one.
-
-## Building from Source
-
-OSSFS2 is tested and supported only on Linux with GCC 9 to 13 (inclusive). The build requires the static C++ standard library (libstdc++.a) and CMake 3.8 or higher. The compilation and installation commands are as follows:
-
-```bash
-git clone https://github.com/aliyun/ossfs.git
-cd ossfs
-mkdir build && cd build
-cmake ..
-make -j4
-make install
-```
-
-> [!NOTE] 
-> For both pre-compiled packages and source compilation, aarch64 support is currently only available for Alibaba Cloud Linux 3. Other ARM-based systems are not supported.
-
-## Contributing
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
-
-Please ensure your code follows the existing style and includes appropriate tests.
+Live catalog and mounted-filesystem tests require a dedicated test database and table; they create and delete test files. Historical live, FUSE and AddressSanitizer results in the commit message describe the earlier validation runs, not CI checks on every revision. The GitHub CMake workflow builds the binaries but does not run the tests.
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## Support
-
-For troubleshooting and common questions, consult the [OSSFS2 FAQ](https://www.alibabacloud.com/help/en/oss/developer-reference/ossfs-2-0-faq). If the issue persists, please file a report in the GitHub repository or contact the project maintainers.
+Apache-2.0, as upstream ossfs2.

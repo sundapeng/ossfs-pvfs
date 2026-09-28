@@ -504,6 +504,12 @@ void Ossfs2TestSuite::SetUp() {
   clean_test_dir();
   setup_test_dir();
 
+  if (is_pvfs_test_mode()) {
+    pvfs_helper_ = std::make_unique<PvfsTestHelper>();
+    ASSERT_EQ(pvfs_helper_->init(), 0) << "PVFS test helper init failed";
+    LOG_INFO("PVFS test mode enabled, prefix `", FLAGS_oss_bucket_prefix);
+  }
+
   // Initialize HDFS test helper if in HDFS mode.
   is_hdfs_mode_ = is_hdfs_test_mode();
   if (is_hdfs_mode_) {
@@ -570,6 +576,7 @@ void Ossfs2TestSuite::TearDown() {
   if (is_hdfs_mode_) {
     hdfs_helper_.reset();
   }
+  pvfs_helper_.reset();
 
   g_fault_injector->clear_all_injections();
 
@@ -613,11 +620,36 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
   }
 
   bool use_list_obj_v2 = rand() % 2;
-  bg_vcpu_env_.bg_obj_store_env = new OssFileSystem::BGVCpuObjStoreEnv;
   int vcpu_num = bg_vcpu_num_ > 0 ? bg_vcpu_num_ : rand() % 4 + 1;
   LOG_INFO("create ` background vcpu oss client", vcpu_num);
 
-  for (int i = 0; i < vcpu_num; i++) {
+  if (is_pvfs_test_mode()) {
+    // The same OSS client settings, applied to every table store.
+    PvfsFileSystem::PvfsRuntimeOptions opts;
+    int r = pvfs_test_runtime_options(&opts, pvfs_prefix_.value_or(prefix));
+    if (r != 0) return r;
+    opts.readonly = pvfs_readonly_;
+    auto &so = opts.cache.store_options;
+    if (max_list_ret != -1) so.max_list_ret_cnt = max_list_ret;
+    so.user_agent = kUserAgentPrefix + MACRO_STR(OSSFS_VERSION_ID);
+    so.bind_ips = bind_ips;
+    so.request_timeout_us = timeout_ms * 1000;
+    so.use_list_obj_v2 = use_list_obj_v2;
+    so.use_auth_cache = rand() % 2;
+    so.proxy = FLAGS_http_proxy;
+    pvfs_env_ = std::make_unique<PvfsTestEnv>();
+    r = pvfs_env_->init(opts, vcpu_num);
+    if (r != 0) {
+      LOG_ERROR("Failed to init the PVFS env: `", r);
+      return r;
+    }
+    bg_vcpu_env_.bg_obj_store_env = pvfs_env_->release_env();
+    oss_options_ = bg_vcpu_env_.bg_obj_store_env->obj_stores[0]->get_options();
+  } else {
+    bg_vcpu_env_.bg_obj_store_env = new OssFileSystem::BGVCpuObjStoreEnv;
+  }
+
+  for (int i = 0; i < vcpu_num && !is_pvfs_test_mode(); i++) {
     ScopedBlockAllSignal block_signals;
 
     auto executor = new photon::Executor(
@@ -744,6 +776,8 @@ int Ossfs2TestSuite::do_init(OssFsOptions fs_opts, int max_list_ret,
 
 void Ossfs2TestSuite::destroy() {
   if (fs_) delete fs_;
+  // The PVFS runtime deletes its table stores on the env's vCPUs.
+  pvfs_env_.reset();
   if (bg_vcpu_env_.bg_obj_store_env) delete bg_vcpu_env_.bg_obj_store_env;
   if (bg_vcpu_env_.bg_disk_cache_env) delete bg_vcpu_env_.bg_disk_cache_env;
 }
@@ -1252,6 +1286,8 @@ int Ossfs2TestSuite::upload_file(const std::string &local_file,
                                  const std::string &oss_prefix) {
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
 
+  if (pvfs_helper_) return pvfs_helper_->upload_file(local_file, osspath);
+
   if (is_hdfs_mode_) {
     std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
     // HDFS SDK's jdo_open always creates a regular file, even if the
@@ -1298,6 +1334,7 @@ int Ossfs2TestSuite::copy_file(const std::string &src, const std::string &dst,
 
   std::string src_path = join_paths(oss_prefix, get_test_osspath(src));
   std::string dst_path = join_paths(oss_prefix, get_test_osspath(dst));
+  if (pvfs_helper_) return pvfs_helper_->copy_file(src_path, dst_path);
   std::string cmd;
   std::string ossutil = lookup_ossutil();
 
@@ -1320,6 +1357,7 @@ int Ossfs2TestSuite::delete_file(const std::string &target,
                                  const std::string &oss_prefix) {
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
 
+  if (pvfs_helper_) return pvfs_helper_->delete_file(osspath);
   if (is_hdfs_mode_) {
     std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
     return hdfs_helper_->delete_file(hdfs_path);
@@ -1345,6 +1383,7 @@ int Ossfs2TestSuite::create_dir(const std::string &target,
                                 const std::string &oss_prefix) {
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
 
+  if (pvfs_helper_) return pvfs_helper_->create_dir(osspath);
   if (is_hdfs_mode_) {
     std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
     return hdfs_helper_->create_dir(hdfs_path);
@@ -1372,6 +1411,7 @@ int Ossfs2TestSuite::delete_dir(const std::string &target,
                                 const std::string &oss_prefix) {
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
 
+  if (pvfs_helper_) return pvfs_helper_->delete_dir(osspath);
   if (is_hdfs_mode_) {
     std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
     return hdfs_helper_->delete_dir_recursive(hdfs_path);
@@ -1398,6 +1438,7 @@ int Ossfs2TestSuite::stat_file(const std::string &target,
                                const std::string &oss_prefix) {
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
 
+  if (pvfs_helper_) return pvfs_helper_->stat_file(osspath);
   if (is_hdfs_mode_) {
     std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
     return hdfs_helper_->stat_file(hdfs_path);
@@ -1424,6 +1465,10 @@ std::map<std::string, std::string> Ossfs2TestSuite::get_file_meta(
     const std::string &target, const std::string &oss_prefix) {
   std::map<std::string, std::string> res;
 
+  if (pvfs_helper_) {
+    return pvfs_helper_->get_file_meta(
+        join_paths(oss_prefix, get_test_osspath(target)));
+  }
   if (is_hdfs_mode_) {
     // HDFS: use SDK to get Content-Length and compute CRC64 by reading back.
     std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
@@ -1489,6 +1534,10 @@ int Ossfs2TestSuite::set_file_meta(const std::string &target,
     LOG_DEBUG("set_file_meta: not supported in HDFS mode, skipping");
     return 0;
   }
+  if (pvfs_helper_) {
+    LOG_ERROR("set_file_meta: not supported in PVFS mode");
+    return -ENOTSUP;
+  }
 
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
   std::string cmd;
@@ -1515,6 +1564,7 @@ std::vector<std::string> Ossfs2TestSuite::get_list_objects(
   std::vector<std::string> res;
   std::string osspath = join_paths(oss_prefix, get_test_osspath(target));
 
+  if (pvfs_helper_) return pvfs_helper_->get_list_objects(osspath, include_self);
   if (is_hdfs_mode_) {
     std::string hdfs_path = hdfs_helper_->full_uri("/" + osspath);
     hdfs_helper_->list_dir(hdfs_path, res);
@@ -1606,8 +1656,8 @@ int Ossfs2TestSuite::upload_file_tree(int depth, int width, int files,
 int Ossfs2TestSuite::create_oss_symlink(const std::string &object,
                                         const std::string &link,
                                         const std::string &oss_prefix) {
-  if (is_hdfs_mode_) {
-    LOG_ERROR("create_oss_symlink: not supported in HDFS mode");
+  if (is_hdfs_mode_ || pvfs_helper_) {
+    LOG_ERROR("create_oss_symlink: not supported in HDFS or PVFS mode");
     return -ENOTSUP;
   }
 
@@ -1632,8 +1682,8 @@ int Ossfs2TestSuite::create_oss_symlink(const std::string &object,
 int Ossfs2TestSuite::read_oss_symlink(const std::string &object,
                                       std::string &link,
                                       const std::string &oss_prefix) {
-  if (is_hdfs_mode_) {
-    LOG_ERROR("read_oss_symlink: not supported in HDFS mode");
+  if (is_hdfs_mode_ || pvfs_helper_) {
+    LOG_ERROR("read_oss_symlink: not supported in HDFS or PVFS mode");
     return -ENOTSUP;
   }
 

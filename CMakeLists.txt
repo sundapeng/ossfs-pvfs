@@ -152,12 +152,14 @@ file(GLOB_RECURSE ossfs2_common_srcs RELATIVE "${PROJECT_SOURCE_DIR}"
   src/oss/*.cpp
   src/metric/*.cpp
   src/credentials/*.cpp
-  src/admin/*.cpp)
+  src/admin/*.cpp
+  src/pvfs/*.cpp)
 
 file(GLOB_RECURSE ossfs2_test_srcs RELATIVE "${PROJECT_SOURCE_DIR}"
   src/common/test/*.cpp
   src/fs/test/*.cpp
-  src/fs/test/hdfs/*.cpp)
+  src/fs/test/hdfs/*.cpp
+  src/pvfs/test/*.cpp)
 
 list(REMOVE_ITEM ossfs2_common_srcs ${ossfs2_test_srcs})
 
@@ -169,6 +171,8 @@ set(static_deps
   ${CITYHASH_LIBRARIES})
 
 add_library(ossfs2_common STATIC ${ossfs2_common_srcs})
+target_compile_definitions(ossfs2_common PRIVATE
+  OSSFS_VERSION_ID=${OSSFS_VERSION_ID})
 
 target_sources(ossfs2_common PRIVATE
   ${PHOTON_PATCHED_SRC_DIR}/ecosystem/oss_patched.cpp
@@ -255,14 +259,24 @@ if (ENABLE_TESTING)
     src/fs/test/*.cpp
     src/fs/test/hdfs/*.cpp
     src/common/test/*.cpp
+    src/pvfs/test/*.cpp
     src/test/*.cpp)
 
-  add_executable(ossfs2-test ${ossfs2_test_srcs} src/options.cpp)
+  add_executable(ossfs2-test ${ossfs2_test_srcs} src/options.cpp
+    src/pvfs_options.cpp)
 
   set_target_properties(ossfs2-test PROPERTIES
     BUILD_RPATH "$ORIGIN:${LIBFUSE_LIB_DIR}:${JINDOSDK_LIB_DIR}:$ORIGIN/${JINDOSDK_DIR_NAME}/lib")
   target_link_libraries(ossfs2-test ossfs2_common ${test_static_deps} 
     ${LIBFUSE_LIBRARIES} rt dl pthread -static-libgcc -static-libstdc++)
+
+  # pvfs-test is the same binary; its name selects the PVFS suites by default.
+  add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/pvfs-test
+    COMMAND ${CMAKE_COMMAND} -E create_symlink ossfs2-test ${CMAKE_BINARY_DIR}/pvfs-test
+    DEPENDS ossfs2-test
+    COMMENT "Creating symlink: pvfs-test -> ossfs2-test")
+  add_custom_target(pvfs-test ALL DEPENDS ${CMAKE_BINARY_DIR}/pvfs-test)
 endif()
 
 set(CPACK_COMPONENTS_ALL main debuginfo)
